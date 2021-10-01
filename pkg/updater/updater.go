@@ -26,6 +26,10 @@ import (
 	"github.com/kinvolk/fluxlib/lib"
 	helmrelease "github.com/kinvolk/fluxlib/lib/helm-release"
 	sourcecontroller "github.com/kinvolk/fluxlib/lib/source-controller"
+
+	dockertypes "github.com/docker/docker/api/types"
+	dockercontainer "github.com/docker/docker/api/types/container"
+	dockerclient "github.com/docker/docker/client"
 )
 
 const (
@@ -40,6 +44,7 @@ type Config struct {
 	Dev            bool
 	NebraskaServer string
 	Channel        string
+	Docker         bool
 
 	grc            *sourcecontroller.GitRepoConfig
 	hrc            *helmrelease.HelmReleaseConfig
@@ -74,15 +79,15 @@ func generateGitRepository(pkg *Package) *sourceapi.GitRepository {
 	}
 }
 
-func generateHelmRepository(pkg *Package) *sourceapi.HelmRepository {
-	return &sourceapi.HelmRepository{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      pkg.Name,
-			Namespace: namespace,
-		},
-		Spec: *pkg.HelmRepo,
-	}
-}
+// func generateHelmRepository(pkg *Package) *sourceapi.HelmRepository {
+// 	return &sourceapi.HelmRepository{
+// 		ObjectMeta: metav1.ObjectMeta{
+// 			Name:      pkg.Name,
+// 			Namespace: namespace,
+// 		},
+// 		Spec: *pkg.HelmRepo,
+// 	}
+// }
 
 func Reconcile(cfg *Config) error {
 	kubeconfig, err := ioutil.ReadFile(cfg.Kubeconfig)
@@ -106,7 +111,7 @@ func Reconcile(cfg *Config) error {
 
 	// TODO: Initialize the HelmRepository config.
 
-	if err = cfg.getClusterID(); err != nil {
+	if err = cfg.getClusterID(kubeconfig); err != nil {
 		return fmt.Errorf("retrieving cluster id: %w", err)
 	}
 
@@ -131,26 +136,56 @@ func Reconcile(cfg *Config) error {
 	return nil
 }
 
-func addVToVersion(version string) string {
-	if !strings.HasPrefix(version, "v") {
-		version = "v" + version
+func ReconcileContainer(cfg *Config) error {
+	kubeconfig, err := ioutil.ReadFile(cfg.Kubeconfig)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("reading kubeconfig: %w", err)
 	}
 
-	return version
+	if err := cfg.getClusterID(kubeconfig); err != nil {
+		return fmt.Errorf("retrieving cluster id: %w", err)
+	}
+	cfg.currentVersion = defaultVersion
+
+	if err := cfg.setupNebraskaClient(); err != nil {
+		return fmt.Errorf("setting up nebraska client: %w", err)
+	}
+
+	log.Debug("initialization complete")
+
+	_ = wait.PollInfinite(time.Duration(cfg.Interval)*time.Second*10, func() (done bool, err error) {
+		log.Debug("reconciling infinitely!")
+
+		if err := cfg.reconcileContainer(); err != nil {
+			log.Error(err)
+		}
+
+		return false, nil
+	})
+
+	return nil
 }
+
+// func addVToVersion(version string) string {
+// 	if !strings.HasPrefix(version, "v") {
+// 		version = "v" + version
+// 	}
+
+// 	return version
+// }
 
 func removeVFromVersion(version string) string {
 	return strings.TrimPrefix(version, "v")
 }
 
-func (cfg *Config) getClusterID() error {
+func (cfg *Config) getClusterID(kubeconfig []byte) error {
 	// Return random UUID when using dev mode.
 	if cfg.Dev {
 		cfg.clusterID = string(uuid.NewUUID())
 		return nil
 	}
 
-	c, err := lib.GetKubernetesClient([]byte(cfg.Kubeconfig), nil)
+	c, err := lib.GetKubernetesClient(kubeconfig, nil)
 	if err != nil {
 		return fmt.Errorf("creating kubernetes client: %w", err)
 	}
@@ -336,6 +371,96 @@ func (cfg *Config) reconcile() error {
 		_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
 
 		return err
+	}
+
+	// Update the current version to the new one.
+	cfg.currentVersion = version
+
+	_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressInstallationFinished)
+	_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressUpdateComplete)
+
+	cfg.nbsClient.SetInstanceVersion(info.GetVersion())
+
+	return nil
+}
+
+func (cfg *Config) reconcileContainer() error {
+	ctx := context.TODO()
+
+	// Let us check if there is an update.
+	info, err := cfg.nbsClient.CheckForUpdates(ctx)
+	if err != nil {
+		return fmt.Errorf("checking for updates: %w", err)
+	}
+
+	// There is no update hence return.
+	if !info.HasUpdate {
+		log.Info("no update available")
+
+		// Print the response just in case.
+		log.Debugf("got this response: %#v", info.GetOmahaResponse().Apps[0])
+
+		return nil
+	}
+
+	_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressDownloadStarted)
+
+	// There is a new update.
+	version := info.GetVersion()
+	link := info.GetURL()
+	name := info.GetPackage().Name
+	containerStopDuration := time.Minute
+
+	log.Debugf("update available: %s", version, link, name)
+
+	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv)
+	if err != nil {
+		_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+		return fmt.Errorf("setting up docker client: %w", err)
+	}
+
+	containers, err := cli.ContainerList(context.Background(), dockertypes.ContainerListOptions{})
+	if err != nil {
+		_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	for _, container := range containers {
+
+		imageName := strings.Split(container.Names[0], "/")
+
+		if imageName[1] == name {
+
+			log.Debug("Stopping and restaring the container")
+
+			err := cli.ContainerStop(context.Background(), container.ID[:10], &containerStopDuration)
+			if err != nil {
+				_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+				return fmt.Errorf("stopping container: %w", err)
+			}
+
+			err = cli.ContainerRemove(context.Background(), container.ID[:10], dockertypes.ContainerRemoveOptions{})
+			if err != nil {
+				_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+				return fmt.Errorf("removing container: %w", err)
+			}
+
+			// Now run a container
+			resp, err := cli.ContainerCreate(ctx, &dockercontainer.Config{
+				Image: name + ":" + version,
+			}, nil, nil, nil, name)
+			if err != nil {
+				_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+				return fmt.Errorf("creating container: %w", err)
+			}
+
+			if err := cli.ContainerStart(ctx, resp.ID, dockertypes.ContainerStartOptions{}); err != nil {
+				_ = cfg.nbsClient.ReportProgress(ctx, updater.ProgressError)
+				return fmt.Errorf("starting container: %w", err)
+			}
+		} else {
+			continue
+		}
 	}
 
 	// Update the current version to the new one.
